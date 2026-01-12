@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Theme colors -->
+    <color name="background">#0F0F1A</color>
+    <color name="card_background">#16213E</color>
+    <color name="input_background">#1A1A2E</color>
+    
+    <!-- Accent colors -->
+    <color name="accent">#E94560</color>
+    <color name="accent_light">#FF6B6B</color>
+    
+    <!-- Text colors -->
+    <color name="text_primary">#EEEEEE</color>
+    <color name="text_secondary">#AAAAAA</color>
+    
+    <!-- Status colors -->
+    <color name="status_running">#4ADE80</color>
+    <color name="status_stopped">#888888</color>
+    <color name="start_color">#4ADE80</color>
+    <color name="stop_color">#E94560</color>
+    <color name="error">#EF4444</color>
+    
+    <!-- Original colors for theme -->
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+    
+    <!-- Primary colors for theme -->
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+</resources>
