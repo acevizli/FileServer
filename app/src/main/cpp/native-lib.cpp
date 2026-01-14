@@ -30,42 +30,34 @@ static void ensureInitialized() {
     }
 }
 
-extern "C" {
-
-JNIEXPORT jboolean JNICALL
-Java_com_acevizli_fileserver_NativeServer_startServer(JNIEnv* env, jobject /* this */, jint port) {
+jboolean startServer(JNIEnv* env, jobject /* this */, jint port) {
     LOGI("startServer called with port: %d", port);
     ensureInitialized();
     return g_server->start(port) ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT void JNICALL
-Java_com_acevizli_fileserver_NativeServer_stopServer(JNIEnv* env, jobject /* this */) {
+void stopServer(JNIEnv* env, jobject /* this */) {
     LOGI("stopServer called");
     if (g_server) {
         g_server->stop();
     }
 }
 
-JNIEXPORT jboolean JNICALL
-Java_com_acevizli_fileserver_NativeServer_isServerRunning(JNIEnv* env, jobject /* this */) {
+jboolean isServerRunning(JNIEnv* env, jobject /* this */) {
     if (g_server) {
         return g_server->isRunning() ? JNI_TRUE : JNI_FALSE;
     }
     return JNI_FALSE;
 }
 
-JNIEXPORT jint JNICALL
-Java_com_acevizli_fileserver_NativeServer_getServerPort(JNIEnv* env, jobject /* this */) {
+jint getServerPort(JNIEnv* env, jobject /* this */) {
     if (g_server) {
         return g_server->getPort();
     }
     return 0;
 }
 
-JNIEXPORT void JNICALL
-Java_com_acevizli_fileserver_NativeServer_setCredentials(JNIEnv* env, jobject /* this */,
-                                                          jstring username, jstring password) {
+void setCredentials(JNIEnv* env, jobject /* this */, jstring username, jstring password) {
     ensureInitialized();
     
     const char* usernameChars = env->GetStringUTFChars(username, nullptr);
@@ -79,10 +71,8 @@ Java_com_acevizli_fileserver_NativeServer_setCredentials(JNIEnv* env, jobject /*
     LOGI("Credentials set for user: %s", usernameChars);
 }
 
-JNIEXPORT void JNICALL
-Java_com_acevizli_fileserver_NativeServer_addFile(JNIEnv* env, jobject /* this */,
-                                                   jstring id, jstring displayName,
-                                                   jstring path, jlong size) {
+void addFile(JNIEnv* env, jobject /* this */, jstring id, jstring displayName,
+                                              jstring path, jlong size) {
     ensureInitialized();
     
     const char* idChars = env->GetStringUTFChars(id, nullptr);
@@ -96,10 +86,8 @@ Java_com_acevizli_fileserver_NativeServer_addFile(JNIEnv* env, jobject /* this *
     env->ReleaseStringUTFChars(path, pathChars);
 }
 
-JNIEXPORT void JNICALL
-Java_com_acevizli_fileserver_NativeServer_addFileDescriptor(JNIEnv* env, jobject /* this */,
-                                                             jstring id, jstring displayName,
-                                                             jint fd, jlong size) {
+void addFileDescriptor(JNIEnv* env, jobject /* this */, jstring id, jstring displayName,
+                                                        jint fd, jlong size) {
     ensureInitialized();
     
     const char* idChars = env->GetStringUTFChars(id, nullptr);
@@ -111,8 +99,7 @@ Java_com_acevizli_fileserver_NativeServer_addFileDescriptor(JNIEnv* env, jobject
     env->ReleaseStringUTFChars(displayName, nameChars);
 }
 
-JNIEXPORT void JNICALL
-Java_com_acevizli_fileserver_NativeServer_removeFile(JNIEnv* env, jobject /* this */, jstring id) {
+void removeFile(JNIEnv* env, jobject /* this */, jstring id) {
     if (!g_fileManager) return;
     
     const char* idChars = env->GetStringUTFChars(id, nullptr);
@@ -120,11 +107,35 @@ Java_com_acevizli_fileserver_NativeServer_removeFile(JNIEnv* env, jobject /* thi
     env->ReleaseStringUTFChars(id, idChars);
 }
 
-JNIEXPORT void JNICALL
-Java_com_acevizli_fileserver_NativeServer_clearFiles(JNIEnv* env, jobject /* this */) {
+void clearFiles(JNIEnv* env, jobject /* this */) {
     if (g_fileManager) {
         g_fileManager->clearFiles();
     }
 }
 
-} // extern "C"
+static const JNINativeMethod gMethods[] = {
+    {"startServer", "(I)Z", (void *) startServer},
+    {"stopServer",          "()V",                                (void *) stopServer},
+    {"isServerRunning", "()Z",               (void *) isServerRunning},
+    {"getServerPort",          "()I",               (void *) getServerPort},
+    {"setCredentials", "(Ljava/lang/String;Ljava/lang/String;)V", (void *) setCredentials},
+    {"addFile", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V", (void *) addFile},
+    {"addFileDescriptor", "(Ljava/lang/String;Ljava/lang/String;IJ)V", (void *) addFileDescriptor},
+    {"removeFile", "(Ljava/lang/String;)V", (void *) removeFile},
+    {"clearFiles", "()V", (void *) clearFiles},
+};
+
+jint JNI_OnLoad(JavaVM *vm, void *) {
+  JNIEnv * env = nullptr;
+  if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+    return JNI_ERR;
+  }
+  if (env == NULL) {
+    return JNI_ERR;
+  }
+  jclass cls = env->FindClass("com/acevizli/fileserver/NativeServer");
+  env->RegisterNatives(cls, gMethods, sizeof(gMethods) / sizeof(gMethods[0]));
+  return JNI_VERSION_1_6;
+}
+
+
