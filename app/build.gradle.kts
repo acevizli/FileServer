@@ -1,3 +1,10 @@
+import java.util.Properties
+
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -17,8 +24,18 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file(localProps.getProperty("RELEASE_STORE_FILE") ?: "fileserver-release.jks")
+            storePassword = localProps.getProperty("RELEASE_STORE_PASSWORD") ?: "fileserver"
+            keyAlias = localProps.getProperty("RELEASE_KEY_ALIAS") ?: "fileserver"
+            keyPassword = localProps.getProperty("RELEASE_KEY_PASSWORD") ?: "fileserver"
+        }
+    }
+
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

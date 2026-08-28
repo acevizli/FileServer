@@ -9,25 +9,33 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import java.io.File
 import java.util.UUID
 
 class FileServerService : Service() {
-    
+
     companion object {
         private const val TAG = "FileServerService"
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "file_server_channel"
         const val DEFAULT_PORT = 8080
+        const val UPLOAD_DIR_NAME = "uploads"
     }
-    
+
     private val binder = LocalBinder()
     private val sharedFiles = mutableListOf<SharedFile>()
     private val fileDescriptors = mutableMapOf<String, ParcelFileDescriptor>()
-    
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Notified on the main thread whenever the shared file list changes */
+    var onFilesChanged: ((uploadedFile: SharedFile?) -> Unit)? = null
+
     var isRunning = false
         private set
     
@@ -45,11 +53,39 @@ class FileServerService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+
+        // C++ calls this from a server thread once an upload is on disk
+        NativeServer.uploadListener = { id, name, path, size ->
+            mainHandler.post { onUploadReceived(id, name, path, size) }
+        }
     }
-    
+
     override fun onDestroy() {
+        NativeServer.uploadListener = null
         stopServer()
         super.onDestroy()
+    }
+
+    /** Directory browser uploads land in */
+    fun uploadDir(): File {
+        val base = getExternalFilesDir(null) ?: filesDir
+        val dir = File(base, UPLOAD_DIR_NAME)
+        if (!dir.exists()) {
+            dir.mkdirs()
+        }
+        return dir
+    }
+
+    private fun onUploadReceived(id: String, name: String, path: String, size: Long) {
+        val file = SharedFile(id, name, Uri.fromFile(File(path)), size, localPath = path)
+        sharedFiles.add(file)
+
+        Log.i(TAG, "Received upload: $name ($size bytes) -> $path")
+
+        if (isRunning) {
+            updateNotification()
+        }
+        onFilesChanged?.invoke(file)
     }
     
     private fun createNotificationChannel() {
@@ -97,12 +133,15 @@ class FileServerService : Service() {
         }
         
         serverPort = port
-        
+
+        // Tell the native side where to write browser uploads
+        NativeServer.setUploadDir(uploadDir().absolutePath)
+
         // Add all files to native server
         for (file in sharedFiles) {
             addFileToNative(file)
         }
-        
+
         val success = NativeServer.startServer(port)
         if (success) {
             isRunning = true
@@ -141,6 +180,13 @@ class FileServerService : Service() {
     
     private fun addFileToNative(file: SharedFile) {
         try {
+            val path = file.localPath
+            if (path != null) {
+                // Uploaded file already on our own storage - serve it straight from the path
+                NativeServer.addFile(file.id, file.displayName, path, file.size)
+                return
+            }
+
             // Open file descriptor for content:// URIs
             val pfd = contentResolver.openFileDescriptor(file.uri, "r")
             if (pfd != null) {
@@ -151,19 +197,19 @@ class FileServerService : Service() {
             Log.e(TAG, "Failed to open file: ${file.displayName}", e)
         }
     }
-    
+
     fun removeFile(file: SharedFile) {
         sharedFiles.remove(file)
-        
+
         // Close file descriptor
         fileDescriptors[file.id]?.close()
         fileDescriptors.remove(file.id)
-        
+
         if (isRunning) {
             NativeServer.removeFile(file.id)
             updateNotification()
         }
-        
+
         Log.i(TAG, "Removed file: ${file.displayName}")
     }
     

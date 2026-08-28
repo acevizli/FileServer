@@ -82,6 +82,119 @@ inline std::string getIndexHtml() {
             margin-top: 15px;
         }
         
+        .upload-card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 30px;
+            border: 1px solid var(--border);
+        }
+
+        .upload-card h2 {
+            font-size: 1.1rem;
+            margin-bottom: 16px;
+        }
+
+        .drop-zone {
+            border: 2px dashed var(--border);
+            border-radius: 12px;
+            padding: 32px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .drop-zone:hover,
+        .drop-zone.dragover {
+            border-color: var(--accent);
+            background: rgba(233, 69, 96, 0.08);
+        }
+
+        .drop-zone .icon {
+            font-size: 40px;
+            margin-bottom: 10px;
+        }
+
+        .drop-zone p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+
+        .drop-zone .browse {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        #fileInput {
+            display: none;
+        }
+
+        .upload-queue {
+            margin-top: 16px;
+            display: none;
+        }
+
+        .queue-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 0;
+            border-top: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+
+        .queue-item .qname {
+            flex: 1;
+            min-width: 0;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .queue-item .qstatus {
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+            flex-shrink: 0;
+        }
+
+        .queue-item.done .qstatus { color: var(--success); }
+        .queue-item.failed .qstatus { color: var(--accent); }
+
+        .progress {
+            height: 6px;
+            background: var(--bg-secondary);
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 16px;
+            display: none;
+        }
+
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--accent), var(--accent-hover));
+            transition: width 0.2s ease;
+        }
+
+        .upload-btn {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.95rem;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 16px;
+            display: none;
+        }
+
+        .upload-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
         .files-grid {
             display: flex;
             flex-direction: column;
@@ -225,10 +338,23 @@ inline std::string getIndexHtml() {
         <header>
             <div class="logo">📁</div>
             <h1>File Server</h1>
-            <p class="subtitle">Download shared files securely</p>
+            <p class="subtitle">Send files to your phone, or grab the ones it shares</p>
             <div class="file-count" id="fileCount">Loading...</div>
         </header>
-        
+
+        <div class="upload-card">
+            <h2>⬆️ Send to phone</h2>
+            <div class="drop-zone" id="dropZone">
+                <div class="icon">📤</div>
+                <p>Drop files here or <span class="browse">browse</span></p>
+                <p style="margin-top: 6px; font-size: 0.8rem;">They get written to the phone's storage</p>
+            </div>
+            <input type="file" id="fileInput" multiple>
+            <div class="upload-queue" id="uploadQueue"></div>
+            <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
+            <button class="upload-btn" id="uploadBtn">Upload</button>
+        </div>
+
         <div id="filesContainer" class="loading">
             <div class="spinner"></div>
             <p>Loading files...</p>
@@ -292,10 +418,10 @@ inline std::string getIndexHtml() {
                     <div class="file-card">
                         <div class="file-icon">${getFileIcon(file.name)}</div>
                         <div class="file-info">
-                            <div class="file-name">${file.name}</div>
+                            <div class="file-name">${escapeHtml(file.name)}</div>
                             <div class="file-size">${formatFileSize(file.size)}</div>
                         </div>
-                        <a href="/download/${file.id}" class="download-btn" download="${file.name}">
+                        <a href="/download/${encodeURIComponent(file.id)}" class="download-btn" download="${escapeHtml(file.name)}">
                             ⬇️ Download
                         </a>
                     </div>
@@ -313,6 +439,154 @@ inline std::string getIndexHtml() {
             }
         }
         
+        // ---- Upload ----
+
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const queueEl = document.getElementById('uploadQueue');
+        const progressEl = document.getElementById('progress');
+        const progressBar = document.getElementById('progressBar');
+
+        let pending = [];
+        let uploading = false;
+
+        function renderQueue() {
+            if (pending.length === 0) {
+                queueEl.style.display = 'none';
+                uploadBtn.style.display = 'none';
+                return;
+            }
+
+            queueEl.style.display = 'block';
+            uploadBtn.style.display = 'block';
+            uploadBtn.textContent = 'Upload ' + pending.length + ' file' + (pending.length !== 1 ? 's' : '');
+
+            queueEl.innerHTML = pending.map((f, i) => `
+                <div class="queue-item" id="queueItem${i}">
+                    <span>${getFileIcon(f.name)}</span>
+                    <span class="qname">${escapeHtml(f.name)}</span>
+                    <span class="qstatus" id="queueStatus${i}">${formatFileSize(f.size)}</span>
+                </div>
+            `).join('');
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function setQueueState(state, message) {
+            pending.forEach((f, i) => {
+                const item = document.getElementById('queueItem' + i);
+                const status = document.getElementById('queueStatus' + i);
+                if (item) item.className = 'queue-item ' + state;
+                if (status && message) status.textContent = message;
+            });
+        }
+
+        function addFiles(fileList) {
+            if (uploading) return;
+            for (const file of fileList) {
+                pending.push(file);
+            }
+            renderQueue();
+        }
+
+        dropZone.addEventListener('click', () => {
+            if (!uploading) fileInput.click();
+        });
+
+        fileInput.addEventListener('change', () => {
+            addFiles(fileInput.files);
+            fileInput.value = '';
+        });
+
+        ['dragenter', 'dragover'].forEach(evt => {
+            dropZone.addEventListener(evt, e => {
+                e.preventDefault();
+                dropZone.classList.add('dragover');
+            });
+        });
+
+        ['dragleave', 'drop'].forEach(evt => {
+            dropZone.addEventListener(evt, e => {
+                e.preventDefault();
+                dropZone.classList.remove('dragover');
+            });
+        });
+
+        dropZone.addEventListener('drop', e => {
+            if (e.dataTransfer && e.dataTransfer.files) {
+                addFiles(e.dataTransfer.files);
+            }
+        });
+
+        // Let the whole page accept a drop without navigating away
+        window.addEventListener('dragover', e => e.preventDefault());
+        window.addEventListener('drop', e => e.preventDefault());
+
+        uploadBtn.addEventListener('click', () => {
+            if (uploading || pending.length === 0) return;
+
+            const form = new FormData();
+            for (const file of pending) {
+                form.append('files', file, file.name);
+            }
+
+            uploading = true;
+            uploadBtn.disabled = true;
+            progressEl.style.display = 'block';
+            progressBar.style.width = '0%';
+            setQueueState('', 'waiting...');
+
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/upload');
+
+            xhr.upload.addEventListener('progress', e => {
+                if (e.lengthComputable) {
+                    const percent = Math.round((e.loaded / e.total) * 100);
+                    progressBar.style.width = percent + '%';
+                    setQueueState('', percent + '%');
+                }
+            });
+
+            xhr.addEventListener('load', () => {
+                uploading = false;
+                uploadBtn.disabled = false;
+
+                let result = null;
+                try {
+                    result = JSON.parse(xhr.responseText);
+                } catch (e) {
+                    // fall through to the generic error below
+                }
+
+                if (xhr.status === 200 && result && result.ok) {
+                    progressBar.style.width = '100%';
+                    setQueueState('done', 'saved ✓');
+                    setTimeout(() => {
+                        pending = [];
+                        renderQueue();
+                        progressEl.style.display = 'none';
+                        loadFiles();
+                    }, 1200);
+                } else {
+                    const message = (result && result.error) ? result.error : 'upload failed';
+                    setQueueState('failed', message);
+                }
+            });
+
+            xhr.addEventListener('error', () => {
+                uploading = false;
+                uploadBtn.disabled = false;
+                setQueueState('failed', 'connection lost');
+            });
+
+            xhr.send(form);
+        });
+
         loadFiles();
     </script>
 </body>

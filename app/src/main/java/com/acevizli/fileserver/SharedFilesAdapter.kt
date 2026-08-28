@@ -31,7 +31,11 @@ class SharedFilesAdapter(
         val file = getItem(position)
         
         holder.nameView.text = file.displayName
-        holder.sizeView.text = formatFileSize(file.size)
+        holder.sizeView.text = if (file.fromWeb) {
+            "⬆ received • ${formatFileSize(file.size)}"
+        } else {
+            formatFileSize(file.size)
+        }
         holder.iconView.setImageResource(getFileIcon(file.displayName))
         
         holder.removeButton.setOnClickListener {

@@ -18,7 +18,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         native-lib.cpp
         http_server.cpp
         file_manager.cpp
-        auth_manager.cpp)
+        auth_manager.cpp
+        multipart_parser.cpp)
 
 # Specifies libraries CMake should link to your target library.
 target_link_libraries(${CMAKE_PROJECT_NAME}

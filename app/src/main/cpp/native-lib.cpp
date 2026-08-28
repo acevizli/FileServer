@@ -16,6 +16,50 @@ static std::unique_ptr<HttpServer> g_server;
 static std::unique_ptr<FileManager> g_fileManager;
 static std::unique_ptr<AuthManager> g_authManager;
 
+// Cached for calling back into Kotlin from server threads
+static JavaVM* g_vm = nullptr;
+static jclass g_nativeServerClass = nullptr;
+static jmethodID g_onFileUploadedMethod = nullptr;
+
+static void notifyFileUploaded(const std::string& id, const std::string& name,
+                               const std::string& path, size_t size) {
+    if (!g_vm || !g_nativeServerClass || !g_onFileUploadedMethod) {
+        return;
+    }
+
+    // Upload runs on a detached server thread, so attach it to the JVM first
+    JNIEnv* env = nullptr;
+    bool attached = false;
+
+    if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGE("Failed to attach thread for upload callback");
+            return;
+        }
+        attached = true;
+    }
+
+    jstring jId = env->NewStringUTF(id.c_str());
+    jstring jName = env->NewStringUTF(name.c_str());
+    jstring jPath = env->NewStringUTF(path.c_str());
+
+    env->CallStaticVoidMethod(g_nativeServerClass, g_onFileUploadedMethod,
+                              jId, jName, jPath, static_cast<jlong>(size));
+
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+
+    env->DeleteLocalRef(jId);
+    env->DeleteLocalRef(jName);
+    env->DeleteLocalRef(jPath);
+
+    if (attached) {
+        g_vm->DetachCurrentThread();
+    }
+}
+
 static void ensureInitialized() {
     if (!g_fileManager) {
         g_fileManager = std::make_unique<FileManager>();
@@ -27,6 +71,7 @@ static void ensureInitialized() {
         g_server = std::make_unique<HttpServer>();
         g_server->setFileManager(g_fileManager.get());
         g_server->setAuthManager(g_authManager.get());
+        g_server->setUploadCallback(notifyFileUploaded);
     }
 }
 
@@ -113,6 +158,15 @@ void clearFiles(JNIEnv* env, jobject /* this */) {
     }
 }
 
+void setUploadDir(JNIEnv* env, jobject /* this */, jstring dir) {
+    ensureInitialized();
+
+    const char* dirChars = env->GetStringUTFChars(dir, nullptr);
+    g_server->setUploadDir(dirChars);
+    LOGI("Upload dir: %s", dirChars);
+    env->ReleaseStringUTFChars(dir, dirChars);
+}
+
 static const JNINativeMethod gMethods[] = {
     {"startServer", "(I)Z", (void *) startServer},
     {"stopServer",          "()V",                                (void *) stopServer},
@@ -123,6 +177,7 @@ static const JNINativeMethod gMethods[] = {
     {"addFileDescriptor", "(Ljava/lang/String;Ljava/lang/String;IJ)V", (void *) addFileDescriptor},
     {"removeFile", "(Ljava/lang/String;)V", (void *) removeFile},
     {"clearFiles", "()V", (void *) clearFiles},
+    {"setUploadDir", "(Ljava/lang/String;)V", (void *) setUploadDir},
 };
 
 jint JNI_OnLoad(JavaVM *vm, void *) {
@@ -134,7 +189,22 @@ jint JNI_OnLoad(JavaVM *vm, void *) {
     return JNI_ERR;
   }
   jclass cls = env->FindClass("com/acevizli/fileserver/NativeServer");
+  if (cls == NULL) {
+    return JNI_ERR;
+  }
   env->RegisterNatives(cls, gMethods, sizeof(gMethods) / sizeof(gMethods[0]));
+
+  // Keep what we need to push upload events back to Kotlin
+  g_vm = vm;
+  g_nativeServerClass = static_cast<jclass>(env->NewGlobalRef(cls));
+  g_onFileUploadedMethod = env->GetStaticMethodID(
+      g_nativeServerClass, "onFileUploaded",
+      "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V");
+  if (g_onFileUploadedMethod == NULL) {
+    LOGE("onFileUploaded callback not found");
+    env->ExceptionClear();
+  }
+
   return JNI_VERSION_1_6;
 }
 

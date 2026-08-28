@@ -2,13 +2,18 @@
 #include "file_manager.h"
 #include "auth_manager.h"
 #include "web_frontend.h"
+#include "multipart_parser.h"
 
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <cstring>
+#include <cstdio>
+#include <cstdint>
+#include <ctime>
 #include <sstream>
 #include <algorithm>
 #include <android/log.h>
@@ -17,9 +22,9 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-HttpServer::HttpServer() 
-    : serverSocket_(-1), running_(false), port_(0), 
-      fileManager_(nullptr), authManager_(nullptr) {
+HttpServer::HttpServer()
+    : serverSocket_(-1), running_(false), port_(0),
+      fileManager_(nullptr), authManager_(nullptr), uploadCounter_(0) {
     LOGI("HttpServer created");
 }
 
@@ -33,6 +38,22 @@ void HttpServer::setFileManager(FileManager* fm) {
 
 void HttpServer::setAuthManager(AuthManager* am) {
     authManager_ = am;
+}
+
+void HttpServer::setUploadDir(const std::string& dir) {
+    std::lock_guard<std::mutex> lock(uploadMutex_);
+    uploadDir_ = dir;
+
+    // Make sure it exists - Kotlin creates it too, this is just belt and braces
+    if (!dir.empty()) {
+        mkdir(dir.c_str(), 0755);
+    }
+    LOGI("Upload directory set to %s", dir.c_str());
+}
+
+void HttpServer::setUploadCallback(UploadCallback callback) {
+    std::lock_guard<std::mutex> lock(uploadMutex_);
+    uploadCallback_ = std::move(callback);
 }
 
 bool HttpServer::start(int port) {
@@ -153,10 +174,9 @@ void HttpServer::handleClient(int clientSocket) {
     
     std::string method, path;
     std::unordered_map<std::string, std::string> headers;
-    
-    std::string body = parseRequest(clientSocket, method, path, headers);
-    
-    if (method.empty()) {
+    std::string leftoverBody;
+
+    if (!parseRequest(clientSocket, method, path, headers, leftoverBody) || method.empty()) {
         close(clientSocket);
         return;
     }
@@ -208,6 +228,12 @@ void HttpServer::handleClient(int clientSocket) {
             sendResponse(clientSocket, 404, "Not Found", respHeaders,
                         "<html><body><h1>404 Not Found</h1></body></html>");
         }
+    } else if (method == "POST") {
+        if (path == "/api/upload") {
+            handleUpload(clientSocket, headers, leftoverBody);
+        } else {
+            sendJson(clientSocket, 404, "Not Found", "{\"ok\":false,\"error\":\"Unknown endpoint\"}");
+        }
     } else {
         // Method not allowed
         std::unordered_map<std::string, std::string> respHeaders;
@@ -219,28 +245,38 @@ void HttpServer::handleClient(int clientSocket) {
     close(clientSocket);
 }
 
-std::string HttpServer::parseRequest(int clientSocket, std::string& method, std::string& path,
-                                     std::unordered_map<std::string, std::string>& headers) {
+bool HttpServer::parseRequest(int clientSocket, std::string& method, std::string& path,
+                              std::unordered_map<std::string, std::string>& headers,
+                              std::string& leftoverBody) {
     char buffer[BUFFER_SIZE];
     std::string requestData;
-    
+
     // Read request headers
-    while (requestData.find("\r\n\r\n") == std::string::npos && 
+    while (requestData.find("\r\n\r\n") == std::string::npos &&
            requestData.size() < MAX_HEADER_SIZE) {
-        ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
+        ssize_t bytesRead = recv(clientSocket, buffer, BUFFER_SIZE, 0);
         if (bytesRead <= 0) {
             break;
         }
-        buffer[bytesRead] = '\0';
-        requestData += buffer;
+        // append() rather than += so binary body bytes survive embedded NULs
+        requestData.append(buffer, static_cast<size_t>(bytesRead));
     }
-    
+
     if (requestData.empty()) {
-        return "";
+        return false;
     }
-    
+
+    // Split the header block from anything that already arrived of the body
+    size_t headerEnd = requestData.find("\r\n\r\n");
+    std::string headerBlock = (headerEnd == std::string::npos)
+                                  ? requestData
+                                  : requestData.substr(0, headerEnd + 2);
+    leftoverBody = (headerEnd == std::string::npos)
+                       ? ""
+                       : requestData.substr(headerEnd + 4);
+
     // Parse request line
-    std::istringstream stream(requestData);
+    std::istringstream stream(headerBlock);
     std::string requestLine;
     std::getline(stream, requestLine);
     
@@ -281,14 +317,8 @@ std::string HttpServer::parseRequest(int clientSocket, std::string& method, std:
             headers[key] = value;
         }
     }
-    
-    // Extract body if present
-    size_t bodyStart = requestData.find("\r\n\r\n");
-    if (bodyStart != std::string::npos) {
-        return requestData.substr(bodyStart + 4);
-    }
-    
-    return "";
+
+    return !method.empty();
 }
 
 void HttpServer::sendResponse(int clientSocket, int statusCode, const std::string& statusText,
@@ -312,7 +342,14 @@ void HttpServer::sendResponse(int clientSocket, int statusCode, const std::strin
     send(clientSocket, responseStr.c_str(), responseStr.size(), 0);
 }
 
-void HttpServer::sendFileResponse(int clientSocket, int fd, size_t fileSize, 
+void HttpServer::sendJson(int clientSocket, int statusCode, const std::string& statusText,
+                          const std::string& json) {
+    std::unordered_map<std::string, std::string> headers;
+    headers["Content-Type"] = "application/json";
+    sendResponse(clientSocket, statusCode, statusText, headers, json);
+}
+
+void HttpServer::sendFileResponse(int clientSocket, int fd, size_t fileSize,
                                    const std::string& mimeType) {
     std::ostringstream headers;
     headers << "HTTP/1.1 200 OK\r\n";
@@ -358,17 +395,8 @@ std::string HttpServer::handleApiFiles() {
         if (!first) json << ",";
         first = false;
         
-        // Escape JSON strings
-        std::string escapedName = file.displayName;
-        // Simple escape for quotes
-        size_t pos = 0;
-        while ((pos = escapedName.find('"', pos)) != std::string::npos) {
-            escapedName.replace(pos, 1, "\\\"");
-            pos += 2;
-        }
-        
-        json << "{\"id\":\"" << file.id << "\","
-             << "\"name\":\"" << escapedName << "\","
+        json << "{\"id\":\"" << jsonEscape(file.id) << "\","
+             << "\"name\":\"" << jsonEscape(file.displayName) << "\","
              << "\"size\":" << file.size << "}";
     }
     
@@ -420,6 +448,184 @@ bool HttpServer::handleFileDownload(int clientSocket, const std::string& fileId)
     
     close(fd);
     return true;
+}
+
+void HttpServer::handleUpload(int clientSocket,
+                              const std::unordered_map<std::string, std::string>& headers,
+                              const std::string& leftoverBody) {
+    std::string uploadDir;
+    UploadCallback callback;
+    {
+        std::lock_guard<std::mutex> lock(uploadMutex_);
+        uploadDir = uploadDir_;
+        callback = uploadCallback_;
+    }
+
+    if (uploadDir.empty()) {
+        sendJson(clientSocket, 503, "Service Unavailable",
+                 "{\"ok\":false,\"error\":\"Upload storage is not ready on the device\"}");
+        return;
+    }
+
+    // Content-Type must carry the multipart boundary
+    auto contentTypeIt = headers.find("content-type");
+    if (contentTypeIt == headers.end()) {
+        sendJson(clientSocket, 400, "Bad Request",
+                 "{\"ok\":false,\"error\":\"Missing Content-Type\"}");
+        return;
+    }
+
+    const std::string& contentType = contentTypeIt->second;
+    std::string contentTypeLower = contentType;
+    std::transform(contentTypeLower.begin(), contentTypeLower.end(),
+                   contentTypeLower.begin(), ::tolower);
+
+    if (contentTypeLower.find("multipart/form-data") == std::string::npos) {
+        sendJson(clientSocket, 415, "Unsupported Media Type",
+                 "{\"ok\":false,\"error\":\"Expected multipart/form-data\"}");
+        return;
+    }
+
+    size_t boundaryPos = contentTypeLower.find("boundary=");
+    if (boundaryPos == std::string::npos) {
+        sendJson(clientSocket, 400, "Bad Request",
+                 "{\"ok\":false,\"error\":\"Missing multipart boundary\"}");
+        return;
+    }
+
+    std::string boundary = contentType.substr(boundaryPos + strlen("boundary="));
+    size_t semicolon = boundary.find(';');
+    if (semicolon != std::string::npos) {
+        boundary = boundary.substr(0, semicolon);
+    }
+    // Trim whitespace and optional quotes
+    boundary.erase(0, boundary.find_first_not_of(" \t\""));
+    size_t lastGood = boundary.find_last_not_of(" \t\"\r\n");
+    if (lastGood != std::string::npos) {
+        boundary.erase(lastGood + 1);
+    }
+
+    if (boundary.empty()) {
+        sendJson(clientSocket, 400, "Bad Request",
+                 "{\"ok\":false,\"error\":\"Empty multipart boundary\"}");
+        return;
+    }
+
+    auto lengthIt = headers.find("content-length");
+    if (lengthIt == headers.end()) {
+        sendJson(clientSocket, 411, "Length Required",
+                 "{\"ok\":false,\"error\":\"Content-Length required\"}");
+        return;
+    }
+
+    unsigned long long declaredLength = 0;
+    try {
+        declaredLength = std::stoull(lengthIt->second);
+    } catch (...) {
+        sendJson(clientSocket, 400, "Bad Request",
+                 "{\"ok\":false,\"error\":\"Invalid Content-Length\"}");
+        return;
+    }
+
+    if (declaredLength > MAX_UPLOAD_SIZE ||
+        declaredLength > static_cast<unsigned long long>(SIZE_MAX)) {
+        sendJson(clientSocket, 413, "Payload Too Large",
+                 "{\"ok\":false,\"error\":\"Upload is too large for this device\"}");
+        return;
+    }
+
+    size_t contentLength = static_cast<size_t>(declaredLength);
+
+    // curl and friends wait for this before sending a large body
+    auto expectIt = headers.find("expect");
+    if (expectIt != headers.end()) {
+        std::string expect = expectIt->second;
+        std::transform(expect.begin(), expect.end(), expect.begin(), ::tolower);
+        if (expect.find("100-continue") != std::string::npos) {
+            const char* cont = "HTTP/1.1 100 Continue\r\n\r\n";
+            send(clientSocket, cont, strlen(cont), 0);
+        }
+    }
+
+    // Uploads can take a while between chunks on a weak link
+    struct timeval timeout;
+    timeout.tv_sec = 120;
+    timeout.tv_usec = 0;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    MultipartParser parser(boundary, uploadDir);
+    bool ok = parser.parse(
+        [clientSocket](char* buf, size_t n) -> long {
+            return static_cast<long>(recv(clientSocket, buf, n, 0));
+        },
+        leftoverBody, contentLength);
+
+    // Leave nothing unread on the socket, otherwise close() resets the
+    // connection and the browser reports a network error instead of our status
+    parser.drainRemaining(MAX_DRAIN_SIZE);
+
+    if (!ok) {
+        LOGE("Upload failed: %s", parser.error().c_str());
+        sendJson(clientSocket, 400, "Bad Request",
+                 "{\"ok\":false,\"error\":\"" + jsonEscape(parser.error()) + "\"}");
+        return;
+    }
+
+    // Register each saved file so it shows up on the phone and in the web list
+    std::ostringstream json;
+    json << "{\"ok\":true,\"files\":[";
+
+    bool first = true;
+    for (const auto& file : parser.files()) {
+        std::string id = nextUploadId();
+
+        if (fileManager_) {
+            fileManager_->addFile(id, file.fileName, file.path, file.size);
+        }
+        if (callback) {
+            callback(id, file.fileName, file.path, file.size);
+        }
+
+        if (!first) json << ",";
+        first = false;
+        json << "{\"id\":\"" << jsonEscape(id) << "\","
+             << "\"name\":\"" << jsonEscape(file.fileName) << "\","
+             << "\"size\":" << file.size << "}";
+    }
+
+    json << "]}";
+
+    LOGI("Upload complete: %zu file(s)", parser.files().size());
+    sendJson(clientSocket, 200, "OK", json.str());
+}
+
+std::string HttpServer::nextUploadId() {
+    unsigned long n = ++uploadCounter_;
+    return "up-" + std::to_string(static_cast<long long>(time(nullptr))) + "-" + std::to_string(n);
+}
+
+std::string HttpServer::jsonEscape(const std::string& value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+
+    for (char c : value) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out;
 }
 
 std::string HttpServer::getMimeType(const std::string& filename) {

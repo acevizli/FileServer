@@ -41,10 +41,24 @@ class MainActivity : AppCompatActivity() {
             val localBinder = binder as FileServerService.LocalBinder
             fileServerService = localBinder.getService()
             serviceBound = true
+
+            // Files uploaded from a browser show up through this callback
+            fileServerService?.onFilesChanged = { uploaded ->
+                updateFilesList()
+                if (uploaded != null) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Received ${uploaded.displayName}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+
             updateUI()
         }
-        
+
         override fun onServiceDisconnected(name: ComponentName?) {
+            fileServerService?.onFilesChanged = null
             fileServerService = null
             serviceBound = false
         }
@@ -83,6 +97,7 @@ class MainActivity : AppCompatActivity() {
     
     override fun onDestroy() {
         if (serviceBound) {
+            fileServerService?.onFilesChanged = null
             unbindService(serviceConnection)
             serviceBound = false
         }
@@ -253,9 +268,11 @@ class MainActivity : AppCompatActivity() {
             val port = service?.serverPort ?: FileServerService.DEFAULT_PORT
             binding.serverStatus.text = "Running at http://$ip:$port"
             binding.serverStatus.setTextColor(ContextCompat.getColor(this, R.color.status_running))
+            binding.uploadPath.text = "Browser uploads are saved to ${service?.uploadDir()?.absolutePath}"
         } else {
             binding.serverStatus.text = "Not running"
             binding.serverStatus.setTextColor(ContextCompat.getColor(this, R.color.status_stopped))
+            binding.uploadPath.text = ""
         }
         
         // Disable inputs when running
