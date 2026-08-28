@@ -10,8 +10,10 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.IBinder
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
@@ -35,6 +37,23 @@ class MainActivity : AppCompatActivity() {
         fileServerService?.removeFile(file)
         updateFilesList()
     }
+
+    private val pendingUploadsAdapter = PendingUploadsAdapter(
+        onSave = { upload ->
+            val saved = fileServerService?.savePendingUpload(upload)
+            updatePendingList()
+            Toast.makeText(
+                this,
+                if (saved != null) "Saved to ${saved.absolutePath}" else "Could not save ${upload.displayName}",
+                Toast.LENGTH_LONG
+            ).show()
+        },
+        onDiscard = { upload ->
+            fileServerService?.discardPendingUpload(upload)
+            updatePendingList()
+            Toast.makeText(this, "Discarded ${upload.displayName}", Toast.LENGTH_SHORT).show()
+        }
+    )
     
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -42,13 +61,15 @@ class MainActivity : AppCompatActivity() {
             fileServerService = localBinder.getService()
             serviceBound = true
 
-            // Files uploaded from a browser show up through this callback
-            fileServerService?.onFilesChanged = { uploaded ->
-                updateFilesList()
-                if (uploaded != null) {
+            fileServerService?.onFilesChanged = { updateFilesList() }
+
+            // Browser uploads land in quarantine and wait for the user to save them
+            fileServerService?.onPendingUploadsChanged = { arrival ->
+                updatePendingList()
+                if (arrival != null) {
                     Toast.makeText(
                         this@MainActivity,
-                        "Received ${uploaded.displayName}",
+                        "Received ${arrival.displayName}",
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -59,6 +80,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun onServiceDisconnected(name: ComponentName?) {
             fileServerService?.onFilesChanged = null
+            fileServerService?.onPendingUploadsChanged = null
             fileServerService = null
             serviceBound = false
         }
@@ -98,6 +120,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         if (serviceBound) {
             fileServerService?.onFilesChanged = null
+            fileServerService?.onPendingUploadsChanged = null
             unbindService(serviceConnection)
             serviceBound = false
         }
@@ -106,8 +129,30 @@ class MainActivity : AppCompatActivity() {
     
     private fun setupUI() {
         // RecyclerView setup
+        // Both lists expand to their full height and the page scrolls as a whole,
+        // so the RecyclerViews must not try to scroll (or consume drags) themselves
         binding.filesRecyclerView.layoutManager = LinearLayoutManager(this)
         binding.filesRecyclerView.adapter = sharedFilesAdapter
+        binding.filesRecyclerView.isNestedScrollingEnabled = false
+        binding.filesRecyclerView.setHasFixedSize(false)
+
+        binding.pendingRecyclerView.layoutManager = LinearLayoutManager(this)
+        binding.pendingRecyclerView.adapter = pendingUploadsAdapter
+        binding.pendingRecyclerView.isNestedScrollingEnabled = false
+        binding.pendingRecyclerView.setHasFixedSize(false)
+
+        binding.saveAllButton.setOnClickListener {
+            val count = fileServerService?.saveAllPendingUploads() ?: 0
+            updatePendingList()
+            val dir = fileServerService?.saveDir()?.absolutePath
+            Toast.makeText(this, "Saved $count file(s) to $dir", Toast.LENGTH_LONG).show()
+        }
+
+        binding.discardAllButton.setOnClickListener {
+            fileServerService?.discardAllPendingUploads()
+            updatePendingList()
+            Toast.makeText(this, "Discarded all received files", Toast.LENGTH_SHORT).show()
+        }
         
         // Server toggle button
         binding.serverToggle.setOnClickListener {
@@ -162,6 +207,33 @@ class MainActivity : AppCompatActivity() {
         
         if (permissionsToRequest.isNotEmpty()) {
             permissionLauncher.launch(permissionsToRequest.toTypedArray())
+        }
+
+        requestAllFilesAccess()
+    }
+
+    /**
+     * Writing uploads into /storage/emulated/0/FileServer needs all-files access
+     * on Android 11+; without it the service falls back to app-private storage.
+     */
+    private fun requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        if (Environment.isExternalStorageManager()) return
+
+        Toast.makeText(
+            this,
+            "Allow all-files access so web uploads can be saved to /FileServer",
+            Toast.LENGTH_LONG
+        ).show()
+        try {
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        } catch (e: Exception) {
+            startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
         }
     }
     
@@ -268,7 +340,8 @@ class MainActivity : AppCompatActivity() {
             val port = service?.serverPort ?: FileServerService.DEFAULT_PORT
             binding.serverStatus.text = "Running at http://$ip:$port"
             binding.serverStatus.setTextColor(ContextCompat.getColor(this, R.color.status_running))
-            binding.uploadPath.text = "Browser uploads are saved to ${service?.uploadDir()?.absolutePath}"
+            binding.uploadPath.text =
+                "Uploads are held privately until you save them to ${service?.saveDir()?.absolutePath}"
         } else {
             binding.serverStatus.text = "Not running"
             binding.serverStatus.setTextColor(ContextCompat.getColor(this, R.color.status_stopped))
@@ -281,8 +354,17 @@ class MainActivity : AppCompatActivity() {
         binding.portInput.isEnabled = !isRunning
         
         updateFilesList()
+        updatePendingList()
     }
-    
+
+    /** The received-from-web card only exists while something is waiting */
+    private fun updatePendingList() {
+        val pending = fileServerService?.getPendingUploads().orEmpty()
+        pendingUploadsAdapter.submitList(pending)
+        binding.pendingCard.visibility = if (pending.isEmpty()) View.GONE else View.VISIBLE
+        binding.pendingTitle.text = "Received From Web (${pending.size})"
+    }
+
     private fun updateIpAddress() {
         val ip = getLocalIpAddress()
         binding.ipAddress.text = "Your IP: $ip"

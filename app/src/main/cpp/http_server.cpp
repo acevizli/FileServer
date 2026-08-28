@@ -16,6 +16,8 @@
 #include <ctime>
 #include <sstream>
 #include <algorithm>
+#include <vector>
+#include <random>
 #include <android/log.h>
 
 #define LOG_TAG "HttpServer"
@@ -212,6 +214,14 @@ void HttpServer::handleClient(int clientSocket) {
             respHeaders["Content-Type"] = "application/json";
             sendResponse(clientSocket, 200, "OK", respHeaders, json);
         }
+        else if (path == "/download-all.zip") {
+            if (!handleZipDownload(clientSocket)) {
+                std::unordered_map<std::string, std::string> respHeaders;
+                respHeaders["Content-Type"] = "text/html; charset=utf-8";
+                sendResponse(clientSocket, 404, "Not Found", respHeaders,
+                            "<html><body><h1>404 Not Found</h1><p>Nothing to zip.</p></body></html>");
+            }
+        }
         else if (path.rfind("/download/", 0) == 0) {
             std::string fileId = path.substr(10); // Remove "/download/"
             if (!handleFileDownload(clientSocket, fileId)) {
@@ -404,6 +414,295 @@ std::string HttpServer::handleApiFiles() {
     return json.str();
 }
 
+// ---------------------------------------------------------------------------
+// Minimal store-only ZIP writer
+//
+// Everything is written with compression method 0, so the archive is a container
+// rather than a compressor: file bytes go out untouched and we can compute the
+// exact Content-Length up front instead of falling back to chunked encoding.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+uint32_t crc32Update(uint32_t crc, const unsigned char* data, size_t len) {
+    static uint32_t table[256];
+    static bool tableReady = false;
+    if (!tableReady) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) {
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            table[i] = c;
+        }
+        tableReady = true;
+    }
+
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+void put16(std::string& out, uint16_t v) {
+    out.push_back(static_cast<char>(v & 0xFF));
+    out.push_back(static_cast<char>((v >> 8) & 0xFF));
+}
+
+void put32(std::string& out, uint32_t v) {
+    out.push_back(static_cast<char>(v & 0xFF));
+    out.push_back(static_cast<char>((v >> 8) & 0xFF));
+    out.push_back(static_cast<char>((v >> 16) & 0xFF));
+    out.push_back(static_cast<char>((v >> 24) & 0xFF));
+}
+
+// One entry that survived the crc pass and is ready to be streamed
+struct ZipEntry {
+    std::string name;
+    int fd;
+    uint32_t size;
+    uint32_t crc;
+    uint32_t localHeaderOffset;
+};
+
+bool sendAll(int socket, const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(socket, data + sent, len - sent, 0);
+        if (n <= 0) return false;
+        sent += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Short random tag so each archive downloads under its own name instead of
+// every one landing as fileserver.zip and being suffixed by the browser
+std::string randomZipTag() {
+    static const char digits[] = "0123456789ABCDEF";
+    std::random_device rd;
+    std::string tag;
+    tag.reserve(6);
+    for (int i = 0; i < 6; i++) {
+        tag.push_back(digits[rd() % 16]);
+    }
+    return tag;
+}
+
+// Strips path separators so an entry cannot escape the extraction directory
+std::string sanitizeZipName(const std::string& name) {
+    std::string out = name.substr(name.find_last_of("/\\") + 1);
+    if (out.empty() || out == "." || out == "..") {
+        out = "file";
+    }
+    return out;
+}
+
+} // namespace
+
+bool HttpServer::handleZipDownload(int clientSocket) {
+    if (!fileManager_) {
+        return false;
+    }
+
+    auto files = fileManager_->getFiles();
+    if (files.empty()) {
+        return false;
+    }
+
+    // First pass: open each file and checksum it. ZIP wants the crc in the local
+    // header, ahead of the data, and this also gives us the true on-disk size.
+    std::vector<ZipEntry> entries;
+    std::vector<std::string> usedNames;
+
+    for (const auto& shared : files) {
+        int fd;
+        size_t size;
+        std::string name;
+        if (!fileManager_->openFile(shared.id, fd, size, name)) {
+            continue;
+        }
+
+        struct stat st;
+        if (fstat(fd, &st) == 0) {
+            size = static_cast<size_t>(st.st_size);
+        }
+
+        // Without ZIP64 an entry cannot exceed 4 GB, so skip anything that big
+        if (size >= 0xFFFFFFFFull) {
+            LOGE("Skipping %s in zip: too large (%zu bytes)", name.c_str(), size);
+            close(fd);
+            continue;
+        }
+
+        uint32_t crc = 0;
+        char buffer[BUFFER_SIZE];
+        ssize_t bytesRead;
+        size_t counted = 0;
+        while ((bytesRead = read(fd, buffer, BUFFER_SIZE)) > 0) {
+            crc = crc32Update(crc, reinterpret_cast<unsigned char*>(buffer),
+                              static_cast<size_t>(bytesRead));
+            counted += static_cast<size_t>(bytesRead);
+        }
+
+        if (lseek(fd, 0, SEEK_SET) < 0) {
+            LOGE("Cannot rewind %s, skipping in zip", name.c_str());
+            close(fd);
+            continue;
+        }
+
+        ZipEntry entry;
+        entry.name = sanitizeZipName(name);
+        entry.fd = fd;
+        entry.size = static_cast<uint32_t>(counted);
+        entry.crc = crc;
+        entry.localHeaderOffset = 0;
+
+        // Two shared files can carry the same name; keep archive entries unique
+        int suffix = 1;
+        std::string candidate = entry.name;
+        while (std::find(usedNames.begin(), usedNames.end(), candidate) != usedNames.end()) {
+            std::string base = entry.name;
+            std::string ext;
+            size_t dot = base.find_last_of('.');
+            if (dot != std::string::npos && dot > 0) {
+                ext = base.substr(dot);
+                base = base.substr(0, dot);
+            }
+            candidate = base + " (" + std::to_string(suffix) + ")" + ext;
+            suffix++;
+        }
+        entry.name = candidate;
+        usedNames.push_back(candidate);
+
+        entries.push_back(entry);
+    }
+
+    if (entries.empty()) {
+        return false;
+    }
+
+    // Second pass: we now know every size, so the archive length is exact
+    unsigned long long totalSize = 0;
+    unsigned long long offset = 0;
+    for (auto& entry : entries) {
+        entry.localHeaderOffset = static_cast<uint32_t>(offset);
+        offset += 30 + entry.name.size() + entry.size;   // local header + name + data
+        totalSize += 46 + entry.name.size();             // central directory record
+    }
+    totalSize += offset + 22;                            // end of central directory
+
+    std::ostringstream headers;
+    headers << "HTTP/1.1 200 OK\r\n";
+    headers << "Content-Type: application/zip\r\n";
+    headers << "Content-Length: " << totalSize << "\r\n";
+    headers << "Content-Disposition: attachment; filename=\"fileserver-" << randomZipTag()
+            << ".zip\"\r\n";
+    headers << "Connection: close\r\n";
+    headers << "\r\n";
+
+    std::string headerStr = headers.str();
+    if (!sendAll(clientSocket, headerStr.c_str(), headerStr.size())) {
+        for (auto& entry : entries) close(entry.fd);
+        return true;
+    }
+
+    bool aborted = false;
+
+    for (auto& entry : entries) {
+        std::string local;
+        put32(local, 0x04034b50);                     // local file header signature
+        put16(local, 20);                             // version needed
+        put16(local, 0x0800);                         // flags: UTF-8 names
+        put16(local, 0);                              // method: stored
+        put16(local, 0);                              // mod time
+        put16(local, 0x21);                           // mod date (1980-01-01)
+        put32(local, entry.crc);
+        put32(local, entry.size);                     // compressed size
+        put32(local, entry.size);                     // uncompressed size
+        put16(local, static_cast<uint16_t>(entry.name.size()));
+        put16(local, 0);                              // extra field length
+        local += entry.name;
+
+        if (!sendAll(clientSocket, local.data(), local.size())) {
+            aborted = true;
+            break;
+        }
+
+        char buffer[BUFFER_SIZE];
+        ssize_t bytesRead;
+        size_t written = 0;
+        while (written < entry.size && (bytesRead = read(entry.fd, buffer, BUFFER_SIZE)) > 0) {
+            size_t chunk = static_cast<size_t>(bytesRead);
+            if (written + chunk > entry.size) {
+                chunk = entry.size - written;          // never exceed the declared length
+            }
+            if (!sendAll(clientSocket, buffer, chunk)) {
+                aborted = true;
+                break;
+            }
+            written += chunk;
+        }
+        if (aborted) break;
+
+        // A file truncated between the two passes would desync Content-Length;
+        // pad it out so the archive still matches the promised byte count
+        if (written < entry.size) {
+            LOGE("Short read on %s, padding zip entry", entry.name.c_str());
+            std::string padding(entry.size - written, '\0');
+            if (!sendAll(clientSocket, padding.data(), padding.size())) {
+                aborted = true;
+                break;
+            }
+        }
+    }
+
+    if (!aborted) {
+        std::string central;
+        for (const auto& entry : entries) {
+            put32(central, 0x02014b50);               // central directory signature
+            put16(central, 20);                       // version made by
+            put16(central, 20);                       // version needed
+            put16(central, 0x0800);                   // flags: UTF-8 names
+            put16(central, 0);                        // method: stored
+            put16(central, 0);                        // mod time
+            put16(central, 0x21);                     // mod date
+            put32(central, entry.crc);
+            put32(central, entry.size);
+            put32(central, entry.size);
+            put16(central, static_cast<uint16_t>(entry.name.size()));
+            put16(central, 0);                        // extra field length
+            put16(central, 0);                        // comment length
+            put16(central, 0);                        // disk number
+            put16(central, 0);                        // internal attributes
+            put32(central, 0);                        // external attributes
+            put32(central, entry.localHeaderOffset);
+            central += entry.name;
+        }
+
+        uint32_t centralSize = static_cast<uint32_t>(central.size());
+        uint32_t centralOffset = static_cast<uint32_t>(offset);
+
+        put32(central, 0x06054b50);                   // end of central directory
+        put16(central, 0);                            // this disk number
+        put16(central, 0);                            // disk with central directory
+        put16(central, static_cast<uint16_t>(entries.size()));
+        put16(central, static_cast<uint16_t>(entries.size()));
+        put32(central, centralSize);
+        put32(central, centralOffset);
+        put16(central, 0);                            // comment length
+
+        sendAll(clientSocket, central.data(), central.size());
+    }
+
+    for (auto& entry : entries) {
+        close(entry.fd);
+    }
+
+    LOGI("Zip download: %zu entries, %llu bytes", entries.size(), totalSize);
+    return true;
+}
+
 bool HttpServer::handleFileDownload(int clientSocket, const std::string& fileId) {
     if (!fileManager_) {
         return false;
@@ -571,7 +870,9 @@ void HttpServer::handleUpload(int clientSocket,
         return;
     }
 
-    // Register each saved file so it shows up on the phone and in the web list
+    // Notify the Java side about each saved file. Uploads are deliberately NOT
+    // registered with the FileManager: the download list only holds files
+    // shared from the device, so an upload is never served back to the browser.
     std::ostringstream json;
     json << "{\"ok\":true,\"files\":[";
 
@@ -579,9 +880,6 @@ void HttpServer::handleUpload(int clientSocket,
     for (const auto& file : parser.files()) {
         std::string id = nextUploadId();
 
-        if (fileManager_) {
-            fileManager_->addFile(id, file.fileName, file.path, file.size);
-        }
         if (callback) {
             callback(id, file.fileName, file.path, file.size);
         }

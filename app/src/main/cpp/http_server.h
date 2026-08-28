@@ -50,6 +50,8 @@ private:
     std::string handleIndexPage();
     std::string handleApiFiles();
     bool handleFileDownload(int clientSocket, const std::string& fileId);
+    // Streams every shared file as one store-only (uncompressed) ZIP
+    bool handleZipDownload(int clientSocket);
     void handleUpload(int clientSocket,
                       const std::unordered_map<std::string, std::string>& headers,
                       const std::string& leftoverBody);

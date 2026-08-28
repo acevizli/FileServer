@@ -32,35 +32,14 @@ class SharedFilesAdapter(
         
         holder.nameView.text = file.displayName
         holder.sizeView.text = if (file.fromWeb) {
-            "⬆ received • ${formatFileSize(file.size)}"
+            "⬆ received • ${FileFormat.size(file.size)}"
         } else {
-            formatFileSize(file.size)
+            FileFormat.size(file.size)
         }
-        holder.iconView.setImageResource(getFileIcon(file.displayName))
+        holder.iconView.setImageResource(FileFormat.icon(file.displayName))
         
         holder.removeButton.setOnClickListener {
             onRemove(file)
-        }
-    }
-    
-    private fun formatFileSize(bytes: Long): String {
-        if (bytes <= 0) return "0 B"
-        val units = arrayOf("B", "KB", "MB", "GB")
-        val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt()
-        val size = bytes / Math.pow(1024.0, digitGroups.toDouble())
-        return String.format("%.1f %s", size, units[digitGroups.coerceAtMost(units.size - 1)])
-    }
-    
-    private fun getFileIcon(fileName: String): Int {
-        val ext = fileName.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            "jpg", "jpeg", "png", "gif", "webp", "svg" -> R.drawable.ic_image
-            "mp4", "mov", "avi", "mkv", "webm" -> R.drawable.ic_video
-            "mp3", "wav", "flac", "aac", "ogg" -> R.drawable.ic_audio
-            "pdf" -> R.drawable.ic_pdf
-            "doc", "docx", "txt" -> R.drawable.ic_document
-            "zip", "rar", "7z", "tar", "gz" -> R.drawable.ic_archive
-            else -> R.drawable.ic_file
         }
     }
     

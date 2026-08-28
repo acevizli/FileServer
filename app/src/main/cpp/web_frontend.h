@@ -195,6 +195,55 @@ inline std::string getIndexHtml() {
             cursor: not-allowed;
         }
 
+        .files-header {
+            display: none;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .files-header h2 {
+            font-size: 1.1rem;
+            flex: 1;
+            margin: 0;
+        }
+
+        .files-header .hint {
+            display: block;
+            font-size: 0.8rem;
+            font-weight: 400;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .download-all-btn {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-hover) 100%);
+            color: white;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        a.download-all-btn {
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .download-all-btn.secondary {
+            background: transparent;
+            border: 1px solid var(--accent);
+            color: var(--accent);
+        }
+
+        .download-all-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
         .files-grid {
             display: flex;
             flex-direction: column;
@@ -355,6 +404,14 @@ inline std::string getIndexHtml() {
             <button class="upload-btn" id="uploadBtn">Upload</button>
         </div>
 
+        <div class="files-header" id="filesHeader">
+            <h2>⬇️ Shared by phone
+                <span class="hint" id="filesHint"></span>
+            </h2>
+            <a class="download-all-btn" id="downloadZipBtn" href="/download-all.zip">Download All as ZIP</a>
+            <button class="download-all-btn secondary" id="downloadAllBtn">Download Separately</button>
+        </div>
+
         <div id="filesContainer" class="loading">
             <div class="spinner"></div>
             <p>Loading files...</p>
@@ -392,16 +449,27 @@ inline std::string getIndexHtml() {
             return icons[ext] || '📄';
         }
         
+        let sharedFiles = [];
+
         async function loadFiles() {
             try {
                 const response = await fetch('/api/files');
                 const files = await response.json();
+                sharedFiles = files;
                 
                 const container = document.getElementById('filesContainer');
                 const countEl = document.getElementById('fileCount');
                 
                 countEl.textContent = files.length + ' file' + (files.length !== 1 ? 's' : '') + ' available';
-                
+
+                const header = document.getElementById('filesHeader');
+                header.style.display = files.length === 0 ? 'none' : 'flex';
+                if (files.length > 0) {
+                    const total = files.reduce((sum, f) => sum + f.size, 0);
+                    document.getElementById('filesHint').textContent =
+                        files.length + ' file' + (files.length !== 1 ? 's' : '') + ' • ' + formatFileSize(total);
+                }
+
                 if (files.length === 0) {
                     container.innerHTML = `
                         <div class="empty-state">
@@ -428,6 +496,7 @@ inline std::string getIndexHtml() {
                 `).join('');
                 
             } catch (error) {
+                document.getElementById('filesHeader').style.display = 'none';
                 console.error('Error loading files:', error);
                 document.getElementById('filesContainer').innerHTML = `
                     <div class="empty-state">
@@ -585,6 +654,40 @@ inline std::string getIndexHtml() {
             });
 
             xhr.send(form);
+        });
+
+        // Browsers will not hand us a zip, so fetch each file in turn. They are
+        // spaced out because a burst of downloads gets throttled or blocked.
+        const downloadAllBtn = document.getElementById('downloadAllBtn');
+        let downloadingAll = false;
+
+        downloadAllBtn.addEventListener('click', async () => {
+            if (downloadingAll || sharedFiles.length === 0) return;
+
+            downloadingAll = true;
+            downloadAllBtn.disabled = true;
+            const original = downloadAllBtn.textContent;
+
+            for (let i = 0; i < sharedFiles.length; i++) {
+                const file = sharedFiles[i];
+                downloadAllBtn.textContent = 'Downloading ' + (i + 1) + '/' + sharedFiles.length;
+
+                const link = document.createElement('a');
+                link.href = '/download/' + encodeURIComponent(file.id);
+                link.download = file.name;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+
+                await new Promise(resolve => setTimeout(resolve, 800));
+            }
+
+            downloadAllBtn.textContent = 'Done ✓';
+            setTimeout(() => {
+                downloadAllBtn.textContent = original;
+                downloadAllBtn.disabled = false;
+                downloadingAll = false;
+            }, 1500);
         });
 
         loadFiles();
